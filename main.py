@@ -2,6 +2,10 @@ import os
 from openai import OpenAI
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import json
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from datetime import datetime, timedelta, timezone
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -147,5 +151,48 @@ def callbacks(call):
             bot.send_message(chat_id, answer, reply_markup=make_buttons())
         except Exception as e:
             bot.send_message(chat_id, f"Ошибка: {e}")
+def get_calendar_service():
+    service_account_info = json.loads(os.environ.get("GOOGLE_SERVICE_ACCOUNT"))
+    credentials = service_account.Credentials.from_service_account_info(
+        service_account_info,
+        scopes=["https://www.googleapis.com/auth/calendar.readonly"],
+    )
+    service = build("calendar", "v3", credentials=credentials)
+    return service
 
+
+@bot.message_handler(commands=["today"])
+def today_schedule(message):
+    try:
+        service = get_calendar_service()
+
+        now = datetime.now(timezone.utc)
+        end_of_day = now.replace(hour=23, minute=59, second=59)
+
+        events_result = service.events().list(
+            calendarId="primary",
+            timeMin=now.isoformat(),
+            timeMax=end_of_day.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+        ).execute()
+
+        events = events_result.get("items", [])
+
+        if not events:
+            bot.reply_to(message, "Сегодня занятий нет 🎉")
+            return
+
+        response = "📅 Сегодня:\n\n"
+
+        for event in events:
+            start = event["start"].get("dateTime", event["start"].get("date"))
+            dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            time_str = dt.strftime("%H:%M")
+            response += f"{time_str} — {event['summary']}\n"
+
+        bot.reply_to(message, response)
+
+    except Exception as e:
+        bot.reply_to(message, f"Ошибка календаря: {e}")
 bot.polling()
