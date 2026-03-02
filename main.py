@@ -6,6 +6,7 @@ import json
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -166,13 +167,16 @@ def today_schedule(message):
     try:
         service = get_calendar_service()
 
-        now = datetime.now(timezone.utc)
-        end_of_day = now.replace(hour=23, minute=59, second=59)
+        tz = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Moscow"))
+
+        now_msk = datetime.now(tz)
+        start_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_msk = now_msk.replace(hour=23, minute=59, second=59, microsecond=0)
 
         events_result = service.events().list(
-            calendarId="primary",
-            timeMin=now.isoformat(),
-            timeMax=end_of_day.isoformat(),
+            calendarId=os.environ.get("CALENDAR_ID", "primary"),
+            timeMin=start_msk.isoformat(),
+            timeMax=end_msk.isoformat(),
             singleEvents=True,
             orderBy="startTime",
         ).execute()
@@ -187,12 +191,14 @@ def today_schedule(message):
 
         for event in events:
             start = event["start"].get("dateTime", event["start"].get("date"))
-            dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
-            time_str = dt.strftime("%H:%M")
-            response += f"{time_str} — {event['summary']}\n"
+            if "T" in start:  # событие с временем
+                dt = datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone(tz)
+                time_str = dt.strftime("%H:%M")
+                response += f"{time_str} — {event.get('summary','(без названия)')}\n"
+            else:  # событие на весь день
+                response += f"Весь день — {event.get('summary','(без названия)')}\n"
 
         bot.reply_to(message, response)
 
     except Exception as e:
         bot.reply_to(message, f"Ошибка календаря: {e}")
-bot.polling()
