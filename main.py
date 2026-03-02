@@ -1,19 +1,27 @@
 import os
-from openai import OpenAI
+import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-import json
+
+from openai import OpenAI
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 TEACHER_STYLE = os.environ.get("TEACHER_STYLE", "Вежливо, коротко, понятно.")
 
+# Важно: если токена нет — лучше упасть с понятной ошибкой в логах
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN не задан в Railway Variables")
+
 bot = telebot.TeleBot(BOT_TOKEN)
-client = OpenAI(api_key=OPENAI_API_KEY)
+
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 SYSTEM_PROMPT = (
     "Ты — AI-ассистент учителя. "
@@ -21,7 +29,6 @@ SYSTEM_PROMPT = (
     "Пиши по-русски."
 )
 
-# Небольшая библиотека типовых заготовок (можем расширить потом)
 TEMPLATES = {
     "перенос": "Здравствуйте! Давайте перенесём занятие. Мне подойдут варианты: {slots}. Какой вам удобнее?",
     "оплата": "Здравствуйте! Напоминаю про оплату занятий. Подскажите, пожалуйста, когда будет удобно оплатить?",
@@ -38,7 +45,6 @@ def make_buttons():
     )
     return kb
 
-# Храним последний запрос пользователя для кнопки "другой вариант"
 LAST_USER_PROMPT = {}
 
 @bot.message_handler(commands=["start"])
@@ -49,7 +55,8 @@ def start(message):
         "Команды:\n"
         "• /ask <текст> — общий запрос к ассистенту\n"
         "• /reply <текст или тема> — подготовить ответ родителю/ученику\n"
-        "• /templates — список быстрых шаблонов\n\n"
+        "• /templates — список быстрых шаблонов\n"
+        "• /today — расписание на сегодня\n\n"
         "Пример:\n"
         "/reply Родитель просит перенести занятие с сегодня на завтра."
     )
@@ -64,6 +71,10 @@ def ask(message):
     user_text = message.text.replace("/ask", "", 1).strip()
     if not user_text:
         bot.reply_to(message, "Напиши запрос после /ask.")
+        return
+
+    if not client:
+        bot.reply_to(message, "OPENAI_API_KEY не задан в Railway Variables.")
         return
 
     bot.send_chat_action(message.chat.id, "typing")
@@ -81,6 +92,9 @@ def ask(message):
         bot.reply_to(message, f"Ошибка при обращении к AI: {e}")
 
 def generate_reply(user_prompt: str) -> str:
+    if not client:
+        return "OPENAI_API_KEY не задан в Railway Variables."
+
     style = TEACHER_STYLE.strip()
 
     prompt = (
@@ -111,18 +125,19 @@ def reply_cmd(message):
         bot.reply_to(message, "Напиши тему или вставь сообщение после /reply.\nПример:\n/reply перенос")
         return
 
-    # 1) Если это название шаблона — выдаём шаблон
     if text.lower() in TEMPLATES:
-        bot.reply_to(message, f"Шаблон «{text.lower()}»:\n\n{TEMPLATES[text.lower()]}\n\n(Если хочешь — я могу адаптировать под конкретную ситуацию через /reply <сообщение>)")
+        bot.reply_to(
+            message,
+            f"Шаблон «{text.lower()}»:\n\n{TEMPLATES[text.lower()]}\n\n"
+            "(Если хочешь — я могу адаптировать под конкретную ситуацию через /reply <сообщение>)"
+        )
         return
 
-    # 2) Иначе — генерируем AI-ответ
     bot.send_chat_action(message.chat.id, "typing")
 
     try:
         chat_id = message.chat.id
         LAST_USER_PROMPT[chat_id] = text
-
         answer = generate_reply(text)
         bot.send_message(chat_id, answer, reply_markup=make_buttons())
     except Exception as e:
@@ -147,20 +162,23 @@ def callbacks(call):
             return
 
         try:
-            # Добавим просьбу сделать ИНОЙ вариант
             answer = generate_reply(user_prompt + "\n\nСделай варианты более отличающимися от предыдущих.")
             bot.send_message(chat_id, answer, reply_markup=make_buttons())
         except Exception as e:
             bot.send_message(chat_id, f"Ошибка: {e}")
+
 def get_calendar_service():
-    service_account_info = json.loads(os.environ.get("GOOGLE_SERVICE_ACCOUNT"))
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT")
+    if not raw:
+        raise Exception("Не найдена переменная GOOGLE_SERVICE_ACCOUNT в Railway Variables.")
+
+    service_account_info = json.loads(raw)
+
     credentials = service_account.Credentials.from_service_account_info(
         service_account_info,
         scopes=["https://www.googleapis.com/auth/calendar.readonly"],
     )
-    service = build("calendar", "v3", credentials=credentials)
-    return service
-
+    return build("calendar", "v3", credentials=credentials)
 
 @bot.message_handler(commands=["today"])
 def today_schedule(message):
@@ -168,13 +186,14 @@ def today_schedule(message):
         service = get_calendar_service()
 
         tz = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Moscow"))
+        calendar_id = os.environ.get("CALENDAR_ID", "primary")
 
         now_msk = datetime.now(tz)
         start_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
         end_msk = now_msk.replace(hour=23, minute=59, second=59, microsecond=0)
 
         events_result = service.events().list(
-            calendarId=os.environ.get("CALENDAR_ID", "primary"),
+            calendarId=calendar_id,
             timeMin=start_msk.isoformat(),
             timeMax=end_msk.isoformat(),
             singleEvents=True,
@@ -188,17 +207,22 @@ def today_schedule(message):
             return
 
         response = "📅 Сегодня:\n\n"
-
         for event in events:
             start = event["start"].get("dateTime", event["start"].get("date"))
-            if "T" in start:  # событие с временем
+            summary = event.get("summary", "(без названия)")
+
+            if start and "T" in start:
                 dt = datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone(tz)
-                time_str = dt.strftime("%H:%M")
-                response += f"{time_str} — {event.get('summary','(без названия)')}\n"
-            else:  # событие на весь день
-                response += f"Весь день — {event.get('summary','(без названия)')}\n"
+                response += f"{dt.strftime('%H:%M')} — {summary}\n"
+            else:
+                response += f"Весь день — {summary}\n"
 
         bot.reply_to(message, response)
 
     except Exception as e:
+        # Это появится и в Telegram, и в Railway Logs будет видно по print
+        print(f"[calendar_error] {e}")
         bot.reply_to(message, f"Ошибка календаря: {e}")
+
+# ✅ ВАЖНО: этого у тебя не было, поэтому бот мог “не слушать”
+bot.infinity_polling(timeout=30, long_polling_timeout=30)
