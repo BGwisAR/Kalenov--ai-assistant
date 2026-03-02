@@ -1,2 +1,5 @@
 pyTelegramBotAPI==4.16.1
 openai>=1.0.0
+google-api-python-client
+google-auth
+google-auth-httplib2
